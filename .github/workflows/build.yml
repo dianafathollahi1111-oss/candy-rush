@@ -1,0 +1,158 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      KS_B64: ${{ secrets.KEYSTORE_BASE64 }}
+      KS_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
+      KEY_ALIAS: ${{ secrets.KEY_ALIAS || 'bonbonpop' }}
+      KEY_PASS: ${{ secrets.KEY_PASSWORD || secrets.KEYSTORE_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - name: Unpack the game
+        run: |
+          set -e
+          echo "Zip files in the repository:"
+          ls -la *.zip || { echo "ERROR: no .zip file in the repository. Upload the game zip without unzipping it."; exit 1; }
+          BEST=""; BESTT=0
+          for z in *.zip; do
+            if unzip -tq "$z" >/dev/null 2>&1; then
+              T=$(git log -1 --format=%ct -- "$z" 2>/dev/null || echo 0); T=${T:-0}
+              echo "valid zip: $z (added at $T)"
+              if [ "$T" -ge "$BESTT" ]; then BEST="$z"; BESTT=$T; fi
+            else
+              echo "NOT A VALID ZIP, skipped: $z ($(stat -c %s "$z") bytes)"
+            fi
+          done
+          [ -n "$BEST" ] || { echo "ERROR: none of the zip files can be opened. Delete them and upload the game zip again."; exit 1; }
+          echo "Using $BEST"
+          mkdir unpacked
+          unzip -q "$BEST" -d unpacked
+          CFG=$(find unpacked -name capacitor.config.json | head -n 1)
+          if [ -n "$CFG" ]; then
+            mv "$(dirname "$CFG")" app
+          else
+            IDX=$(find unpacked -name index.html -not -path "*/node_modules/*" | head -n 1)
+            [ -n "$IDX" ] || { echo "No index.html found in $BEST"; exit 1; }
+            mkdir -p app/www app/assets
+            cp -r "$(dirname "$IDX")"/. app/www/
+            cp app/www/icons/icon-512.png app/assets/icon-only.png 2>/dev/null || true
+            cat > app/capacitor.config.json <<'JSON'
+          {
+            "appId": "com.dianafathollahi.jorchinabnabat",
+            "appName": "Candy Rush",
+            "webDir": "www",
+            "backgroundColor": "#240f2e"
+          }
+          JSON
+            echo '{"name":"bonbon-pop","version":"1.0.0","private":true}' > app/package.json
+          fi
+          ls app app/www | head -30
+      - name: Build the APK
+        working-directory: app
+        run: |
+          npm install @capacitor/core @capacitor/cli @capacitor/android
+          npm install -D @capacitor/assets
+          npx cap add android
+          perl -0pi -e 's/<activity/<activity android:screenOrientation="portrait"/' android/app/src/main/AndroidManifest.xml
+          npx capacitor-assets generate --android || echo "capacitor-assets skipped, using direct icon copy"
+          cat > set-icons.js <<'JS'
+          const sharp = require('sharp'), fs = require('fs'), path = require('path');
+          const src = fs.existsSync('assets/icon-only.png') ? 'assets/icon-only.png' : 'www/icons/icon-512.png';
+          const res = 'android/app/src/main/res';
+          const sizes = { mdpi: 48, hdpi: 72, xhdpi: 96, xxhdpi: 144, xxxhdpi: 192 };
+          (async () => {
+            for (const d of fs.readdirSync(res)) {
+              if (d.startsWith('mipmap-anydpi')) fs.rmSync(path.join(res, d), { recursive: true, force: true });
+            }
+            for (const [k, px] of Object.entries(sizes)) {
+              const dir = path.join(res, 'mipmap-' + k);
+              fs.mkdirSync(dir, { recursive: true });
+              const sq = await sharp(src).resize(px, px).png().toBuffer();
+              const mask = Buffer.from('<svg width="' + px + '" height="' + px + '"><circle cx="' + px / 2 + '" cy="' + px / 2 + '" r="' + px / 2 + '"/></svg>');
+              const round = await sharp(sq).composite([{ input: mask, blend: 'dest-in' }]).png().toBuffer();
+              fs.writeFileSync(path.join(dir, 'ic_launcher.png'), sq);
+              fs.writeFileSync(path.join(dir, 'ic_launcher_round.png'), round);
+              fs.writeFileSync(path.join(dir, 'ic_launcher_foreground.png'), sq);
+            }
+            console.log('Icons written from ' + src);
+          })().catch(e => { console.error('ICON ERROR: ' + e.message); process.exit(1); });
+          JS
+          node set-icons.js
+          npx cap sync android
+          cd android
+          ./gradlew assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bonbon-pop-apk
+          path: app/android/app/build/outputs/apk/debug/app-debug.apk
+      - name: Build signed release (AAB for Google Play, APK for sharing)
+        if: env.KS_B64 != ''
+        working-directory: app/android
+        run: |
+          set -e
+          echo "$KS_B64" | base64 -d > "$RUNNER_TEMP/upload.jks"
+          keytool -list -keystore "$RUNNER_TEMP/upload.jks" -storepass "$KS_PASS" -alias "$KEY_ALIAS" | tail -2
+          perl -pi -e 's/versionCode \d+/versionCode $ENV{GITHUB_RUN_NUMBER}/; s/versionName "[^"]*"/versionName "1.0.$ENV{GITHUB_RUN_NUMBER}"/' app/build.gradle
+          grep -n "versionCode\|versionName\|applicationId" app/build.gradle
+          ./gradlew bundleRelease assembleRelease
+          mkdir -p "$GITHUB_WORKSPACE/release-out"
+          AAB=app/build/outputs/bundle/release/app-release.aab
+          jarsigner -keystore "$RUNNER_TEMP/upload.jks" -storepass "$KS_PASS" -keypass "$KEY_PASS" -sigalg SHA256withRSA -digestalg SHA-256 "$AAB" "$KEY_ALIAS"
+          jarsigner -verify "$AAB" | head -3
+          cp "$AAB" "$GITHUB_WORKSPACE/release-out/jorchin-abnabat.aab"
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          UNSIGNED=$(ls app/build/outputs/apk/release/*.apk | head -n 1)
+          "$BT/zipalign" -p -f 4 "$UNSIGNED" "$RUNNER_TEMP/aligned.apk"
+          "$BT/apksigner" sign --ks "$RUNNER_TEMP/upload.jks" --ks-key-alias "$KEY_ALIAS" --ks-pass env:KS_PASS --key-pass env:KEY_PASS --out "$GITHUB_WORKSPACE/release-out/jorchin-abnabat-release.apk" "$RUNNER_TEMP/aligned.apk"
+          "$BT/apksigner" verify --print-certs "$GITHUB_WORKSPACE/release-out/jorchin-abnabat-release.apk" | head -3
+          echo "--- App info (targetSdkVersion must be 34 or higher) ---"
+          "$BT/aapt2" dump badging "$GITHUB_WORKSPACE/release-out/jorchin-abnabat-release.apk" | grep -E "^package:|sdkVersion|targetSdkVersion" || true
+          TS=$("$BT/aapt2" dump badging "$GITHUB_WORKSPACE/release-out/jorchin-abnabat-release.apk" | sed -n "s/^targetSdkVersion:'\([0-9]*\)'.*/\1/p" | head -n 1)
+          echo "targetSdkVersion = $TS"
+          [ -z "$TS" ] || [ "$TS" -ge 34 ] || { echo "ERROR: targetSdkVersion is below 34"; exit 1; }
+          ls -la "$GITHUB_WORKSPACE/release-out"
+      - name: Say what is missing
+        if: env.KS_B64 == ''
+        run: |
+          echo "Release signing was skipped. Add the secrets KEYSTORE_BASE64 and KEYSTORE_PASSWORD in the repository settings to also get the Google Play file."
+      - uses: actions/upload-artifact@v4
+        if: env.KS_B64 != ''
+        with:
+          name: jorchin-play-release
+          path: release-out/*
+      - name: Collect the website files (privacy page, web app)
+        run: |
+          mkdir -p site
+          cp -r app/www/. site/
+      - uses: actions/upload-pages-artifact@v3
+        continue-on-error: true
+        with:
+          path: site
+  pages:
+    needs: apk
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.dep.outputs.page_url }}
+    steps:
+      - id: dep
+        uses: actions/deploy-pages@v4
